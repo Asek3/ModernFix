@@ -1,6 +1,7 @@
 package org.embeddedt.modernfix.dynamicresources;
 
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Maps;
 import com.mojang.math.Transformation;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import net.minecraft.client.renderer.block.model.BakedQuad;
@@ -22,6 +23,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
@@ -38,54 +40,34 @@ public class DynamicBakedModelProvider implements Map<ResourceLocation, BakedMod
     public static DynamicBakedModelProvider currentInstance = null;
     private final ModelBakery bakery;
     private final Map<Triple<ResourceLocation, Transformation, Boolean>, BakedModel> bakedCache;
-    private final Map<ResourceLocation, BakedModel> permanentOverrides;
+    private final Map<ResourceLocation, ModelHolder> permanentOverrides;
     private BakedModel missingModel;
-    private static final BakedModel SENTINEL = new BakedModel() {
-        @Override
-        public List<BakedQuad> getQuads(@Nullable BlockState state, @Nullable Direction side, Random rand) {
-            return null;
+
+    static class ModelHolder {
+        public final BakedModel model;
+
+        ModelHolder(BakedModel model) {
+            this.model = model;
         }
 
         @Override
-        public boolean useAmbientOcclusion() {
-            return false;
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            ModelHolder that = (ModelHolder) o;
+            return Objects.equals(model, that.model);
         }
 
         @Override
-        public boolean isGui3d() {
-            return false;
+        public int hashCode() {
+            return System.identityHashCode(model);
         }
-
-        @Override
-        public boolean usesBlockLight() {
-            return false;
-        }
-
-        @Override
-        public boolean isCustomRenderer() {
-            return false;
-        }
-
-        @Override
-        public TextureAtlasSprite getParticleIcon() {
-            return null;
-        }
-
-        @Override
-        public ItemTransforms getTransforms() {
-            return null;
-        }
-
-        @Override
-        public ItemOverrides getOverrides() {
-            return null;
-        }
-    };
+    }
 
     public DynamicBakedModelProvider(ModelBakery bakery, Map<Triple<ResourceLocation, Transformation, Boolean>, BakedModel> cache) {
         this.bakery = bakery;
         this.bakedCache = cache;
-        this.permanentOverrides = Collections.synchronizedMap(new Object2ObjectOpenHashMap<>());
+        this.permanentOverrides = new ConcurrentHashMap<>();
         if(currentInstance == null)
             currentInstance = this;
     }
@@ -109,12 +91,15 @@ public class DynamicBakedModelProvider implements Map<ResourceLocation, BakedMod
 
     @Override
     public boolean containsKey(Object o) {
-        return permanentOverrides.getOrDefault(o, SENTINEL) != null;
+        ModelHolder holder = permanentOverrides.get(o);
+        if(holder == null)
+            return true; // lie, because we can probably load the model
+        return holder.model != null; // if null, there was an error, which means we should pretend it isn't loaded
     }
 
     @Override
     public boolean containsValue(Object o) {
-        return permanentOverrides.containsValue(o) || bakedCache.containsValue(o);
+        return permanentOverrides.values().stream().anyMatch(holder -> holder != null && holder.model == o) || bakedCache.containsValue(o);
     }
     
     private static boolean isVanillaTopLevelModel(ResourceLocation location) {
@@ -140,10 +125,11 @@ public class DynamicBakedModelProvider implements Map<ResourceLocation, BakedMod
 
     @Override
     public BakedModel get(Object o) {
-        BakedModel model = permanentOverrides.getOrDefault(o, SENTINEL);
-        if(model != SENTINEL)
-            return model;
+        ModelHolder holder = permanentOverrides.get(o);
+        if(holder != null)
+            return holder.model;
         else {
+            BakedModel model;
             try {
                 if(BAKE_SKIPPED_TOPLEVEL.contains((ResourceLocation)o))
                     model = missingModel;
@@ -156,7 +142,7 @@ public class DynamicBakedModelProvider implements Map<ResourceLocation, BakedMod
             if(model == missingModel) {
                 // to correctly emulate the original map, we return null for missing models, unless they are top-level
                 model = isVanillaTopLevelModel((ResourceLocation)o) ? model : null;
-                permanentOverrides.put((ResourceLocation) o, model);
+                permanentOverrides.put((ResourceLocation) o, new ModelHolder(model));
             }
             return model;
         }
@@ -164,24 +150,24 @@ public class DynamicBakedModelProvider implements Map<ResourceLocation, BakedMod
 
     @Override
     public BakedModel put(ResourceLocation resourceLocation, BakedModel bakedModel) {
-        BakedModel m = permanentOverrides.put(resourceLocation, bakedModel);
+        ModelHolder m = permanentOverrides.put(resourceLocation, new ModelHolder(bakedModel));
         if(m != null)
-            return m;
+            return m.model;
         else
             return bakedCache.get(vanillaKey(resourceLocation));
     }
 
     @Override
     public BakedModel remove(Object o) {
-        BakedModel m = permanentOverrides.remove(o);
+        ModelHolder m = permanentOverrides.remove(o);
         if(m != null)
-            return m;
+            return m.model;
         return bakedCache.remove(vanillaKey(o));
     }
 
     @Override
     public void putAll(@NotNull Map<? extends ResourceLocation, ? extends BakedModel> map) {
-        permanentOverrides.putAll(map);
+        permanentOverrides.putAll(Maps.transformValues(map, ModelHolder::new));
     }
 
     @Override
@@ -210,19 +196,19 @@ public class DynamicBakedModelProvider implements Map<ResourceLocation, BakedMod
     @Nullable
     @Override
     public BakedModel replace(ResourceLocation key, BakedModel value) {
-        BakedModel existingOverride = permanentOverrides.get(key);
+        ModelHolder existingOverride = permanentOverrides.get(key);
         // as long as no valid override was put in (null can mean unable to load model, so we treat as invalid), replace
         // the model
-        if(existingOverride == null)
+        if(existingOverride == null || existingOverride.model == null)
             return this.put(key, value);
         else
-            return existingOverride;
+            return existingOverride.model;
     }
 
     @Override
     public void replaceAll(BiFunction<? super ResourceLocation, ? super BakedModel, ? extends BakedModel> function) {
         Set<ResourceLocation> overridenLocations = permanentOverrides.keySet();
-        permanentOverrides.replaceAll(function);
+        permanentOverrides.replaceAll((key, holder) -> new ModelHolder(function.apply(key, holder.model)));
         boolean uvLock = BlockModelRotation.X0_Y0.isUvLocked();
         Transformation rotation = BlockModelRotation.X0_Y0.getRotation();
         bakedCache.replaceAll((loc, oldModel) -> {
